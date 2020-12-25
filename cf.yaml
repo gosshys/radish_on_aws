@@ -1,0 +1,196 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description:
+  "radish on aws"
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: "radish_on_aws"
+  S3BucketName:
+    Type: String
+    Default: "<Please enter the s3 bucket name>"
+  ImageName:
+    Type: String
+    Default: "999999999999.dkr.ecr.ap-northeast-1.amazonaws.com/radish_on_aws"
+
+Resources:
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      InstanceTenancy: default
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-Vpc"
+
+  Subnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      AvailabilityZone: !Select
+        - 0
+        - Fn::GetAZs: !Ref "AWS::Region"
+      CidrBlock: 10.0.0.0/24
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-Subnet"
+      VpcId: !Ref Vpc
+
+  SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub "${ProjectName}-SecurityGroup"
+      GroupDescription: !Sub "SecurityGroup for ${ProjectName}"
+      VpcId: !Ref Vpc
+
+  Gateway:
+    Type: AWS::EC2::InternetGateway
+
+  VPCGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      InternetGatewayId: !Ref Gateway
+      VpcId: !Ref Vpc
+
+  RouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-RouteTable"
+
+  Route:
+    Type: AWS::EC2::Route
+    Properties:
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref Gateway
+      RouteTableId: !Ref RouteTable
+
+  SubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref RouteTable
+      SubnetId: !Ref Subnet
+
+  TaskExecutorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          -
+            Effect: "Allow"
+            Principal:
+              Service:
+                - "ecs-tasks.amazonaws.com"
+            Action:
+              - "sts:AssumeRole"
+      Policies:
+        -
+          PolicyName: !Sub "${ProjectName}-FargateLauncherRole"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+                Effect: "Allow"
+                # ssm:GetParametersはいらないかも
+                Action:
+                  - "ecr:GetAuthorizationToken"
+                  - "ecr:BatchCheckLayerAvailability"
+                  - "ecr:GetDownloadUrlForLayer"
+                  - "ecr:BatchGetImage"
+                  - "s3:PutObject"
+                  - "ssm:GetParameters"
+                  - "secretsmanager:GetSecretValue"
+                  - "logs:CreateLogGroup"
+                  - "logs:CreateLogStream"
+                  - "logs:PutLogEvents"
+                Resource: "*"
+
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/ecs/logs/${ProjectName}-log-group"
+
+  Cluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub "${ProjectName}-Cluster"
+
+  TaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Cpu: 256
+      ExecutionRoleArn: !Ref TaskExecutorRole
+      TaskRoleArn: !Ref TaskExecutorRole
+      Memory: 512
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      ContainerDefinitions:
+        -
+          # ここで指定するコマンドは下のTaskScheduleで上書きされる
+          Command: !Split [",", !Sub "/var/run.sh,INT,1,test"]
+          Cpu: 256
+          Environment:
+            -
+              Name: BucketName
+              Value: !Ref S3BucketName
+          # Image名はここで
+          Image: !Ref ImageName
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref LogGroup
+              awslogs-region: !Ref "AWS::Region"
+              awslogs-stream-prefix: !Ref ProjectName
+          Memory: 512
+          Name: !Sub "${ProjectName}-container"
+          WorkingDirectory: /var
+
+  ECSEventRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${ProjectName}-ECSEventRole
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - events.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonEC2ContainerServiceEventsRole
+
+  TaskScheduleOne:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub ${ProjectName}-TaskScheduleOne
+      State: ENABLED
+      # 録音を開始する時間をAWS独自のcron式で指定する(UTCなので注意、日本なので-9時間する、朝9時までの録音は前日の曜日を指定する)
+      # fargateの起動時間を考慮して2分前くらいを開始時刻にするとよさそう
+      # https://docs.aws.amazon.com/ja_jp/AmazonCloudWatch/latest/events/ScheduledEvents.html
+      ScheduleExpression: cron(*/5 * * * ? *)
+      Targets:
+        - Id: TaskScheduleOne
+          Arn: !GetAtt Cluster.Arn
+          RoleArn: !GetAtt ECSEventRole.Arn
+          EcsParameters:
+            TaskDefinitionArn: !Ref TaskDefinition
+            TaskCount: 1
+            LaunchType: FARGATE
+            PlatformVersion: LATEST
+            NetworkConfiguration:
+              AwsVpcConfiguration:
+                AssignPublicIp: ENABLED
+                SecurityGroups: 
+                  - !Ref SecurityGroup
+                Subnets:
+                  - !Ref Subnet
+          # ここで、放送局IDと録音時間とS3にアップロードするときのファイル名のプレフィックスを指定する
+          # 放送局IDはネットで検索して調べる
+          Input: !Sub "{\"containerOverrides\": [{\"name\": \"${ProjectName}-container\", \"command\": [\"/var/run.sh\",\"LFR\",\"1\",\"test\"]}]}"
+
