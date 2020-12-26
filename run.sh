@@ -14,7 +14,7 @@ if [ ! -s out.m4a ]; then
 fi
 
 # send to S3
-if [ ! -z $PREFIX ]; then
+if [ -z $PREFIX ]; then
   PREFIX=$STATION_ID
 fi
 ymd=`date +%Y%m%d`
